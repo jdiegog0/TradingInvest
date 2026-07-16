@@ -57,7 +57,7 @@ def procesar_portafolio_con_precios(ruta_excel):
     return df_transacciones, precios_actuales
 
 # ==========================================
-# FUNCIÓN PARA CALCULAR RENDIMIENTOS HISTÓRICOS (PARA PROYECCIÓN)
+# FUNCIÓN PARA CALCULAR RENDIMIENTOS HISTÓRICOS (EL MODELO DE ANÁLISIS)
 # ==========================================
 @st.cache_data(ttl=86400)  # Caché de 24 horas
 def calcular_rendimientos_historicos(tickers):
@@ -72,7 +72,8 @@ def calcular_rendimientos_historicos(tickers):
                 anios = len(hist) / 252  # ~252 días laborables al año
                 
                 cagr = (precio_final / precio_inicial) ** (1 / anios) - 1
-                rendimientos[ticker] = max(min(cagr, 0.25), 0.04)  # Límites sanos (4% a 25%)
+                # Límites realistas para la proyección (4% a 25%)
+                rendimientos[ticker] = max(min(cagr, 0.25), 0.04)  
             else:
                 rendimientos[ticker] = 0.08
         except Exception:
@@ -83,7 +84,9 @@ def calcular_rendimientos_historicos(tickers):
 try:
     df_transacciones, precios_actuales = procesar_portafolio_con_precios("Portafolio.xlsx")
     
-    # Cálculos iniciales
+    # ==========================================
+    # 2. PROCESAMIENTO Y CÁLCULOS GENERALES
+    # ==========================================
     df_detalles = df_transacciones.copy()
     df_detalles['$/Acción actual'] = df_detalles['Ticker'].map(precios_actuales).fillna(0.0)
     df_detalles = df_detalles.rename(columns={
@@ -107,6 +110,12 @@ try:
     df_agrupado['$ ganancia (o perdida)'] = df_agrupado['USD Actual'] - df_agrupado['USD Total Compra']
     df_agrupado['% de ganancia (o perdida)'] = (df_agrupado['$ ganancia (o perdida)'] / df_agrupado['USD Total Compra']) * 100
 
+    # Variables globales para las Métricas (Flags)
+    total_inversion_inicial = df_agrupado['USD Total Compra'].sum()
+    total_portafolio_actual = df_agrupado['USD Actual'].sum()
+    rendimiento_total_pct = ((total_portafolio_actual - total_inversion_inicial) / total_inversion_inicial) * 100 if total_inversion_inicial > 0 else 0.0
+    rendimiento_absoluto = total_portafolio_actual - total_inversion_inicial
+
     # Crear las Pestañas de la App
     tab_actual, tab_proyeccion = st.tabs(["📊 Portafolio Actual", "🔮 Modelo de Proyección"])
 
@@ -114,6 +123,32 @@ try:
     # PESTAÑA 1: PORTAFOLIO ACTUAL
     # =========================================================================
     with tab_actual:
+        
+        # 1. BANDERAS / FLAGS DE MÉTRICAS (Ubicadas horizontalmente arriba de los gráficos)
+        st.subheader("📌 Resumen del Portafolio")
+        m_col1, m_col2, m_col3 = st.columns(3)
+        
+        with m_col1:
+            st.metric(
+                label="Total de Inversión (Costo Inicial)", 
+                value=f"${total_inversion_inicial:,.2f}"
+            )
+        with m_col2:
+            st.metric(
+                label="Precio Portafolio Actual (Valor de Mercado)", 
+                value=f"${total_portafolio_actual:,.2f}",
+                delta=f"${rendimiento_absoluto:+,.2f}"
+            )
+        with m_col3:
+            st.metric(
+                label="Porcentaje Rendimiento Total", 
+                value=f"{rendimiento_total_pct:+.2f}%",
+                delta="Retorno sobre inversión"
+            )
+            
+        st.divider()
+        
+        # 2. GRÁFICOS DE PASTEL
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("📊 Distribución por Sector")
@@ -130,6 +165,7 @@ try:
 
         st.divider()
 
+        # TABLA 2: Consolidada
         st.subheader("📋 Resumen Consolidado de Inversiones (Tabla 2)")
         df_agrupado_final = df_agrupado[['Ticker', '#Acciones', 'USD Actual', '$/Acción compra', '$/Acción actual', '$ ganancia (o perdida)', '% de ganancia (o perdida)']].rename(columns={'USD Actual': 'USD'})
         
@@ -152,6 +188,7 @@ try:
 
         st.divider()
 
+        # TABLA 3: Detalle histórico
         st.subheader("📜 Detalle de Transacciones Históricas (Tabla 3)")
         df_t3_mostrar = df_detalles[['Fecha', 'Tipo', 'Ticker', '#Acciones', 'USD Actual', '$/Acción compra', '$/Acción actual', '$ ganancia (o perdida)', '% de ganancia (o perdida)']].rename(columns={'USD Actual': 'USD'})
         st.dataframe(df_t3_mostrar.style.format({
@@ -163,60 +200,67 @@ try:
     # =========================================================================
     with tab_proyeccion:
         st.subheader("🔮 Simulación de Crecimiento de Capital (5 Años)")
-        st.markdown("Esta proyección utiliza la **Tasa de Crecimiento Anual Compuesto (CAGR)** de cada activo calculada a partir de su historial de los últimos 5 años.")
+        st.markdown("Esta proyección utiliza las tasas de crecimiento reales calculadas por nuestro modelo de análisis histórico de los últimos 5 años.")
 
-        # Obtener rendimientos históricos calculados de la API
-        tickers_unicos = df_agrupado['Ticker'].tolist()
-        cagrs = calcular_rendimientos_historicos(tickers_unicos)
+        # Obtener rendimientos históricos calculados (Modelo de análisis)
+        tickers_unicos_proyeccion = sorted(list(set(df_agrupado['Ticker'].tolist())))
+        cagrs = calcular_rendimientos_historicos(tickers_unicos_proyeccion)
         
-        # Parámetros editables por el usuario
         col_p1, col_p2 = st.columns(2)
+        
+        # Panel izquierdo: Tabla de Tasas de Crecimiento del Modelo de Análisis
         with col_p1:
-            tasas_personalizadas = {}
-            st.write("**Ajustar Tasas Anuales Estimadas por Ticker:**")
-            sub_cols = st.columns(3)
-            for idx, ticker in enumerate(tickers_unicos):
-                col_sub = sub_cols[idx % 3]
-                tasa_default = float(cagrs.get(ticker, 0.08))
-                tasas_personalizadas[ticker] = col_sub.slider(
-                    f"{ticker}", 
-                    min_value=0.0, 
-                    max_value=0.40, 
-                    value=tasa_default, 
-                    format="%.1f%%"
-                )
+            st.write("**📈 Tasas de Crecimiento Anual Estimadas por Ticker (Modelo de Análisis):**")
+            
+            # Construir un DataFrame limpio para la visualización de la tabla de tasas
+            tasas_data = []
+            for ticker in tickers_unicos_proyeccion:
+                tasas_data.append({
+                    "Ticker": ticker,
+                    "Tasa de Crecimiento (CAGR)": cagrs.get(ticker, 0.08)
+                })
+            df_tasas_modelo = pd.DataFrame(tasas_data)
+            
+            # Mostrar la tabla de tasas formateada
+            st.dataframe(
+                df_tasas_modelo.style.format({"Tasa de Crecimiento (CAGR)": "{:.2%}"}),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+        # Panel derecho: Control de DCA mensual
         with col_p2:
-            st.write("**Aportaciones Adicionales (Opcional):**")
+            st.write("**💵 Aportaciones Adicionales (Opcional):**")
             dca_mensual = st.number_input("Inyección de capital mensual (DCA en USD)", min_value=0, value=0, step=50)
-            st.caption("Si agregas un monto aquí, se simulará que compras este valor mensualmente distribuyéndolo equitativamente en tu portafolio actual.")
+            st.caption("Si agregas un monto aquí, se simula que compras este valor mensualmente distribuyéndolo de forma proporcional en tus posiciones actuales.")
 
         # ---- CONSTRUCCIÓN DE LA SIMULACIÓN MES A MES ----
         meses = 60  # 5 años
         fechas_proyeccion = [datetime.today().date() + pd.DateOffset(months=i) for i in range(meses + 1)]
         fechas_proyeccion = [f.date() for f in fechas_proyeccion]
 
-        # Inicializar diccionario para la proyección
         proyeccion_dict = {"Fecha": fechas_proyeccion}
         
-        # Obtener pesos actuales para distribuir el DCA
+        # Obtener pesos actuales para el DCA
         capital_inicial_total = df_agrupado['USD Actual'].sum()
         pesos_activos = {row['Ticker']: row['USD Actual'] / capital_inicial_total if capital_inicial_total > 0 else 0 for _, row in df_agrupado.iterrows()}
 
-        for ticker in tickers_unicos:
+        # Simular mes a mes por ticker usando la tasa fija asignada por el modelo
+        for ticker in tickers_unicos_proyeccion:
             capital_inicial_activo = float(df_agrupado[df_agrupado['Ticker'] == ticker]['USD Actual'].iloc[0])
-            tasa_mensual = (1 + tasas_personalizadas[ticker]) ** (1/12) - 1
+            tasa_anual = cagrs.get(ticker, 0.08)
+            tasa_mensual = (1 + tasa_anual) ** (1/12) - 1
             peso_activo = pesos_activos.get(ticker, 0)
             
             saldos_mes = [capital_inicial_activo]
             for m in range(1, meses + 1):
-                # Aplicar rendimiento compuesto + aportación DCA ponderada
                 nuevo_saldo = saldos_mes[-1] * (1 + tasa_mensual) + (dca_mensual * peso_activo)
                 saldos_mes.append(nuevo_saldo)
                 
             proyeccion_dict[ticker] = saldos_mes
 
         df_proyeccion = pd.DataFrame(proyeccion_dict)
-        df_proyeccion['Total Portafolio'] = df_proyeccion[tickers_unicos].sum(axis=1)
+        df_proyeccion['Total Portafolio'] = df_proyeccion[tickers_unicos_proyeccion].sum(axis=1)
 
         # ---- 1. GRÁFICO DE LÍNEAS TEMPORALES ----
         fig_lineas = go.Figure()
@@ -231,7 +275,7 @@ try:
         ))
         
         # Líneas individuales por ticker
-        for ticker in tickers_unicos:
+        for ticker in tickers_unicos_proyeccion:
             fig_lineas.add_trace(go.Scatter(
                 x=df_proyeccion['Fecha'],
                 y=df_proyeccion[ticker],
@@ -252,27 +296,27 @@ try:
 
         st.divider()
 
-        # ---- 2. TABLA DESGLOSADA POR TICKER (CORREGIDA) ----
+        # ---- 2. TABLA DESGLOSADA POR TICKER ----
         st.subheader("📋 Tabla de Saldos Proyectados Fin de Año (Mes 12 a 60)")
         
         # Seleccionamos las filas correspondientes a los cierres anuales (Meses 0, 12, 24, 36, 48, 60)
         meses_corte = [0, 12, 24, 36, 48, 60]
         df_cortes = df_proyeccion.iloc[meses_corte].copy()
         
-        # Eliminamos la columna de fecha antes de hacer la transposición para evitar el desajuste de dimensiones
+        # Eliminamos la columna de fecha antes de transponer
         df_cortes_sin_fecha = df_cortes.drop(columns=['Fecha'])
         
-        # Transponer el DataFrame: los Tickers quedan como filas y los cortes de tiempo como columnas
+        # Transponer el DataFrame
         df_cortes_transpuesto = df_cortes_sin_fecha.T
         
-        # Definimos exactamente las 6 columnas resultantes del corte temporal
+        # Definimos las columnas anuales
         columnas_años = ["Capital Inicial", "Año 1", "Año 2", "Año 3", "Año 4", "Año 5"]
         df_cortes_transpuesto.columns = columnas_años
         
-        # Resetear el índice para que los Tickers queden como una columna normal legible
+        # Resetear el índice para dejar los Tickers como columna limpia
         df_cortes_transpuesto = df_cortes_transpuesto.reset_index().rename(columns={'index': 'Ticker'})
 
-        # Formatear las columnas monetarias de forma estética
+        # Formatear visualmente con signo de dólar
         formatos_tabla = {col: "${:,.2f}" for col in columnas_años}
         st.dataframe(
             df_cortes_transpuesto.style.format(formatos_tabla),
