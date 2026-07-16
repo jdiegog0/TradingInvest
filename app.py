@@ -23,7 +23,7 @@ st.divider()
 def procesar_portafolio_con_precios(ruta_excel):
     df_transacciones = pd.read_excel(ruta_excel)
     
-    # Limpieza estándar
+    # Limpieza estándar de datos
     df_transacciones['Ticker'] = df_transacciones['Ticker'].str.strip().str.upper()
     df_transacciones['Fecha'] = pd.to_datetime(df_transacciones['Fecha']).dt.date
     df_transacciones['Tipo'] = df_transacciones['Tipo'].str.strip()
@@ -59,33 +59,25 @@ def procesar_portafolio_con_precios(ruta_excel):
 # ==========================================
 # FUNCIÓN PARA CALCULAR RENDIMIENTOS HISTÓRICOS (PARA PROYECCIÓN)
 # ==========================================
-@st.cache_data(ttl=86400)  # Caché de 24 horas (el rendimiento histórico no cambia rápido)
+@st.cache_data(ttl=86400)  # Caché de 24 horas
 def calcular_rendimientos_historicos(tickers):
     rendimientos = {}
     for ticker in tickers:
         try:
-            # Descargamos 5 años de historial para calcular una tasa anualizada sólida
+            # Descargamos 5 años de historial para estimar el retorno anualizado (CAGR)
             hist = yf.download(ticker, period="5y", progress=False)['Close']
             if not hist.empty:
-                # Calcular rendimiento total en el período y anualizarlo
                 precio_inicial = float(hist.dropna().iloc[0])
                 precio_final = float(hist.dropna().iloc[-1])
-                años = len(hist) / 252  # ~252 días laborables por año
+                anios = len(hist) / 252  # ~252 días laborables al año
                 
-                # Fórmula de Tasa de Crecimiento Anual Compuesto (CAGR)
-                cagr = (precio_final / precio_inicial) ** (1 / años) - 1
-                
-                # Limitamos valores atípicos (ej. Nvidia con 100% anualizado no es sostenible a 5 años)
-                rendimientos[ticker] = clip_rendimiento(cagr)
+                cagr = (precio_final / precio_inicial) ** (1 / anios) - 1
+                rendimientos[ticker] = max(min(cagr, 0.25), 0.04)  # Límites sanos (4% a 25%)
             else:
-                rendimientos[ticker] = 0.08  # Retorno base por defecto (8% anual)
+                rendimientos[ticker] = 0.08
         except Exception:
             rendimientos[ticker] = 0.08
     return rendimientos
-
-def clip_rendimiento(rendimiento):
-    # Toque realista: limitar rendimientos anuales entre 4% y 25% para proyecciones sanas
-    return max(min(rendimiento, 0.25), 0.04)
 
 # Cargar el archivo principal
 try:
@@ -171,18 +163,17 @@ try:
     # =========================================================================
     with tab_proyeccion:
         st.subheader("🔮 Simulación de Crecimiento de Capital (5 Años)")
-        st.markdown("Esta proyección utiliza la **Tasa de Crecimiento Anual Compuesto (CAGR)** de cada activo calculada a partir de su historial real de los últimos 5 años.")
+        st.markdown("Esta proyección utiliza la **Tasa de Crecimiento Anual Compuesto (CAGR)** de cada activo calculada a partir de su historial de los últimos 5 años.")
 
         # Obtener rendimientos históricos calculados de la API
         tickers_unicos = df_agrupado['Ticker'].tolist()
         cagrs = calcular_rendimientos_historicos(tickers_unicos)
         
-        # Parámetros editables por el usuario en la interfaz
+        # Parámetros editables por el usuario
         col_p1, col_p2 = st.columns(2)
         with col_p1:
             tasas_personalizadas = {}
             st.write("**Ajustar Tasas Anuales Estimadas por Ticker:**")
-            # Mostrar sliders compactos en columnas para modificar las tasas proyectadas si el usuario quiere
             sub_cols = st.columns(3)
             for idx, ticker in enumerate(tickers_unicos):
                 col_sub = sub_cols[idx % 3]
@@ -204,11 +195,10 @@ try:
         fechas_proyeccion = [datetime.today().date() + pd.DateOffset(months=i) for i in range(meses + 1)]
         fechas_proyeccion = [f.date() for f in fechas_proyeccion]
 
-        # Inicializar DataFrame para la simulación
-        # Cada fila será un mes, cada columna el saldo proyectado de un ticker
+        # Inicializar diccionario para la proyección
         proyeccion_dict = {"Fecha": fechas_proyeccion}
         
-        # Obtener pesos actuales del portafolio para la distribución del DCA mensual
+        # Obtener pesos actuales para distribuir el DCA
         capital_inicial_total = df_agrupado['USD Actual'].sum()
         pesos_activos = {row['Ticker']: row['USD Actual'] / capital_inicial_total if capital_inicial_total > 0 else 0 for _, row in df_agrupado.iterrows()}
 
@@ -219,7 +209,7 @@ try:
             
             saldos_mes = [capital_inicial_activo]
             for m in range(1, meses + 1):
-                # Aplicar interés compuesto mensual + aportación DCA mensual correspondiente al peso del activo
+                # Aplicar rendimiento compuesto + aportación DCA ponderada
                 nuevo_saldo = saldos_mes[-1] * (1 + tasa_mensual) + (dca_mensual * peso_activo)
                 saldos_mes.append(nuevo_saldo)
                 
@@ -231,7 +221,7 @@ try:
         # ---- 1. GRÁFICO DE LÍNEAS TEMPORALES ----
         fig_lineas = go.Figure()
         
-        # Añadir la línea del capital total destacado
+        # Línea de capital total
         fig_lineas.add_trace(go.Scatter(
             x=df_proyeccion['Fecha'],
             y=df_proyeccion['Total Portafolio'],
@@ -240,7 +230,7 @@ try:
             line=dict(color='#00ffcc', width=4)
         ))
         
-        # Añadir las líneas individuales de cada ticker para ver su crecimiento relativo
+        # Líneas individuales por ticker
         for ticker in tickers_unicos:
             fig_lineas.add_trace(go.Scatter(
                 x=df_proyeccion['Fecha'],
@@ -262,24 +252,27 @@ try:
 
         st.divider()
 
-        # ---- 2. TABLA DESGLOSADA POR TICKER ----
+        # ---- 2. TABLA DESGLOSADA POR TICKER (CORREGIDA) ----
         st.subheader("📋 Tabla de Saldos Proyectados Fin de Año (Mes 12 a 60)")
         
-        # Filtramos la tabla para mostrar solo los cortes anuales (Mes 12, 24, 36, 48, 60) e Inicial (Mes 0)
+        # Seleccionamos las filas correspondientes a los cierres anuales (Meses 0, 12, 24, 36, 48, 60)
         meses_corte = [0, 12, 24, 36, 48, 60]
         df_cortes = df_proyeccion.iloc[meses_corte].copy()
         
-        # Transponer el DataFrame para que sea mucho más fácil de leer por ticker en columnas de año
-        df_cortes_transpuesto = df_cortes.set_index('Fecha').T
+        # Eliminamos la columna de fecha antes de hacer la transposición para evitar el desajuste de dimensiones
+        df_cortes_sin_fecha = df_cortes.drop(columns=['Fecha'])
         
-        # Renombrar columnas a términos amigables (Año 1, Año 2...)
-        columnas_años = ["Capital Inicial"] + [f"Año {i}" for i in range(1, 6)]
+        # Transponer el DataFrame: los Tickers quedan como filas y los cortes de tiempo como columnas
+        df_cortes_transpuesto = df_cortes_sin_fecha.T
+        
+        # Definimos exactamente las 6 columnas resultantes del corte temporal
+        columnas_años = ["Capital Inicial", "Año 1", "Año 2", "Año 3", "Año 4", "Año 5"]
         df_cortes_transpuesto.columns = columnas_años
         
-        # Resetear índice para mostrar Ticker como columna limpia
+        # Resetear el índice para que los Tickers queden como una columna normal legible
         df_cortes_transpuesto = df_cortes_transpuesto.reset_index().rename(columns={'index': 'Ticker'})
 
-        # Formatear la visualización numérica
+        # Formatear las columnas monetarias de forma estética
         formatos_tabla = {col: "${:,.2f}" for col in columnas_años}
         st.dataframe(
             df_cortes_transpuesto.style.format(formatos_tabla),
