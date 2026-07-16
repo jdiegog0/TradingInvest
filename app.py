@@ -19,68 +19,89 @@ st.divider()
 # 1. FUNCIÓN PARA CARGAR DATOS Y LLAMAR LA API
 # ==========================================
 @st.cache_data(ttl=1800)  # Caché de 30 minutos para optimizar llamadas
-def procesar_portafolio_con_api(ruta_excel):
-    # Leer el Excel (Pandas puede leer .xlsx directamente)
-    df_transacciones = pd.read_excel(ruta_excel)
+def procesar_portafolio_con_api(ruta_csv):
+    # Leer el CSV directamente
+    df_transacciones = pd.read_csv(ruta_csv)
     
-    # Estandarizar nombres de columnas clave del excel
+    # Estandarizar nombres de columnas y strings
     df_transacciones['Ticker'] = df_transacciones['Ticker'].str.strip().str.upper()
     df_transacciones['Fecha'] = pd.to_datetime(df_transacciones['Fecha']).dt.date
+    df_transacciones['Tipo'] = df_transacciones['Tipo'].str.strip()
     
-    # Obtener tickers únicos para consultar la API
+    # Obtener tickers únicos
     tickers_unicos = df_transacciones['Ticker'].unique().tolist()
     
     precios_actuales = {}
     sectores = {}
     
-    # Consultar yfinance uno por uno para extraer metadatos (como el Sector)
-    # y el último precio de cierre de forma segura
+    # --- CORRECCIÓN DE LA API ---
+    # Descargamos los precios actuales en un solo bloque (lote) para evitar bloqueos por rate-limiting
+    try:
+        datos_mercado = yf.download(tickers_unicos, period="1d")['Close']
+        for ticker in tickers_unicos:
+            try:
+                # Si solo hay un ticker, 'datos_mercado' será una Serie de Pandas. 
+                # Si hay varios tickers, será un DataFrame de Pandas.
+                if isinstance(datos_mercado, pd.Series):
+                    precio = float(datos_mercado.iloc[-1])
+                else:
+                    # Obtenemos el último valor no nulo de la columna del ticker
+                    precio = float(datos_mercado[ticker].dropna().iloc[-1])
+                precios_actuales[ticker] = precio
+            except Exception:
+                # Si falla al extraer el precio del lote, dejamos 0.0 de manera segura
+                precios_actuales[ticker] = 0.0
+    except Exception as e:
+        st.warning(f"Error al descargar precios en lote: {e}. Se intentará de forma individual.")
+        for ticker in tickers_unicos:
+            precios_actuales[ticker] = 0.0
+
+    # Ahora consultamos de forma individual el Sector para no sobrecargar de peticiones pesadas la API de .info
     for ticker in tickers_unicos:
         try:
             ticker_obj = yf.Ticker(ticker)
+            # .info es una petición muy pesada. La protegemos con un try/except interno.
             info = ticker_obj.info
-            
-            # 1. Intentar obtener el Sector (si es un ETF no tiene "sector" directo, se suele usar "category")
-            sector = info.get('sector') or info.get('category') or 'Otros/ETF'
+            if info:
+                sector = info.get('sector') or info.get('category') or 'Otros/ETF'
+            else:
+                sector = 'Otros/ETF'
             sectores[ticker] = sector
             
-            # 2. Intentar obtener el precio de cierre más reciente
-            # Primero buscamos en 'currentPrice', si no, en el historial rápido
-            precio = info.get('currentPrice')
-            if not precio:
-                hist = ticker_obj.history(period="1d")
-                precio = float(hist['Close'].iloc[-1]) if not hist.empty else 0.0
-                
-            precios_actuales[ticker] = float(precio)
-            
-        except Exception as e:
-            st.warning(f"No se pudo obtener datos para {ticker}: {e}")
-            precios_actuales[ticker] = 0.0
-            sectores[ticker] = 'Desconocido'
+            # Salvaguarda por si falló la descarga en lote para este ticker en particular
+            if precios_actuales.get(ticker, 0.0) == 0.0:
+                precio_fallback = info.get('currentPrice') or info.get('previousClose')
+                if precio_fallback:
+                    precios_actuales[ticker] = float(precio_fallback)
+        except Exception:
+            # Si se cae la API .info para este activo, el flujo principal no se detiene
+            sectores[ticker] = 'Otros/ETF'
+            if ticker not in precios_actuales:
+                precios_actuales[ticker] = 0.0
 
     return df_transacciones, precios_actuales, sectores
 
-# Intentar cargar y procesar
+# Intentar cargar y procesar usando el nombre del CSV
 try:
-    df_transacciones, precios_actuales, sectores = procesar_portafolio_con_api("Portafolio.xlsx")
+    df_transacciones, precios_actuales, sectores = procesar_portafolio_con_api("Portafolio.xlsx - Transacciones.csv")
     
     # ==========================================
     # 2. PROCESAMIENTO Y CÁLCULOS
     # ==========================================
     df_detalles = df_transacciones.copy()
     
-    # Mapeamos la información obtenida desde la API
-    df_detalles['Sector'] = df_detalles['Ticker'].map(sectores)
-    df_detalles['$/Acción actual'] = df_detalles['Ticker'].map(precios_actuales)
+    # Mapeamos la información obtenida desde la API de forma segura (.get evita errores de KeyError)
+    df_detalles['Sector'] = df_detalles['Ticker'].map(sectores).fillna('Otros/ETF')
+    df_detalles['$/Acción actual'] = df_detalles['Ticker'].map(precios_actuales).fillna(0.0)
     
-    # Renombrar columnas para coincidir exactamente con lo solicitado en la Tabla 3
+    # Renombrar columnas para coincidir exactamente con el estándar solicitado
     df_detalles = df_detalles.rename(columns={
-        'Cantidad': '#Acciones',
-        'Precio': '$/Acción compra'
+        'Acciones': '#Acciones',
+        '$/Acción': '$/Acción compra',
+        'USD': 'USD Total Compra'
     })
     
-    # Cálculo de métricas dinámicas por transacción
-    df_detalles['USD Total Compra'] = df_detalles['#Acciones'] * df_detalles['$/Acción compra']
+    # Cálculos de mercado en tiempo real
     df_detalles['USD Actual'] = df_detalles['#Acciones'] * df_detalles['$/Acción actual']
     df_detalles['$ ganancia (o perdida)'] = df_detalles['USD Actual'] - df_detalles['USD Total Compra']
     df_detalles['% de ganancia (o perdida)'] = (df_detalles['$ ganancia (o perdida)'] / df_detalles['USD Total Compra']) * 100
@@ -94,13 +115,13 @@ try:
         'USD Actual': 'sum'
     }).reset_index()
     
-    # Recalculamos métricas grupales de rendimiento ponderado
+    # Recalculamos métricas grupales de rendimiento ponderado para la cartera consolidada
     df_agrupado['$/Acción compra'] = df_agrupado['USD Total Compra'] / df_agrupado['#Acciones']
-    df_agrupado['$/Acción actual'] = df_agrupado['Ticker'].map(precios_actuales)
+    df_agrupado['$/Acción actual'] = df_agrupado['Ticker'].map(precios_actuales).fillna(0.0)
     df_agrupado['$ ganancia (o perdida)'] = df_agrupado['USD Actual'] - df_agrupado['USD Total Compra']
     df_agrupado['% de ganancia (o perdida)'] = (df_agrupado['$ ganancia (o perdida)'] / df_agrupado['USD Total Compra']) * 100
 
-    # Formar estructura final para Tabla 2 (Elimina Fecha y Tipo, agrupa Tickers y añade última fila de totales)
+    # Formar estructura final para Tabla 2
     df_agrupado_final = df_agrupado[[
         'Ticker', '#Acciones', 'USD Actual', '$/Acción compra', 
         '$/Acción actual', '$ ganancia (o perdida)', '% de ganancia (o perdida)'
@@ -145,7 +166,7 @@ try:
     
     df_t2_con_total = df_agrupado_final.copy()
     
-    # Totales globales
+    # Totales globales de la cartera
     total_acciones = df_t2_con_total['#Acciones'].sum()
     total_usd_actual = df_t2_con_total['USD'].sum()
     total_costo_compra = df_agrupado['USD Total Compra'].sum()
@@ -166,7 +187,7 @@ try:
     
     st.dataframe(
         df_t2_con_total.style.format({
-            '#Acciones': '{:,.2f}',
+            '#Acciones': '{:,.4f}',
             'USD': '${:,.2f}',
             '$/Acción compra': lambda x: f"${x:,.2f}" if pd.notnull(x) else "-",
             '$/Acción actual': lambda x: f"${x:,.2f}" if pd.notnull(x) else "-",
@@ -184,7 +205,6 @@ try:
     # ==========================================
     st.subheader("📜 Detalle de Transacciones Históricas (Tabla 3)")
     
-    # Mostrar columnas solicitadas incluyendo Fecha, Tipo, Ticker, etc.
     df_t3_mostrar = df_detalles[[
         'Fecha', 'Tipo', 'Ticker', '#Acciones', 'USD Actual', 
         '$/Acción compra', '$/Acción actual', '$ ganancia (o perdida)', '% de ganancia (o perdida)'
@@ -192,7 +212,7 @@ try:
     
     st.dataframe(
         df_t3_mostrar.style.format({
-            '#Acciones': '{:,.2f}',
+            '#Acciones': '{:,.4f}',
             'USD': '${:,.2f}',
             '$/Acción compra': '${:,.2f}',
             '$/Acción actual': '${:,.2f}',
@@ -204,6 +224,6 @@ try:
     )
 
 except FileNotFoundError:
-    st.error("⚠️ No se encontró el archivo 'Portafolio.xlsx' en el directorio del proyecto. Asegúrate de colocarlo al lado de app.py.")
+    st.error("⚠️ No se encontró el archivo 'Portafolio.xlsx - Transacciones.csv'. Asegúrate de guardarlo con ese nombre exacto junto a app.py.")
 except Exception as e:
     st.error(f"⚠️ Ocurrió un error inesperado al procesar el archivo: {e}")
