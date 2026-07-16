@@ -32,7 +32,7 @@ def procesar_portafolio_con_precios(ruta_excel):
     tickers_unicos = df_transacciones['Ticker'].unique().tolist()
     precios_actuales = {}
     
-    # Descargar precios actuales en bloque
+    # Descargar precios actuales en lote
     try:
         datos_mercado = yf.download(tickers_unicos, period="1d", progress=False)['Close']
         for ticker in tickers_unicos:
@@ -57,23 +57,34 @@ def procesar_portafolio_con_precios(ruta_excel):
     return df_transacciones, precios_actuales
 
 # ==========================================
-# FUNCIÓN PARA CALCULAR RENDIMIENTOS HISTÓRICOS (EL MODELO DE ANÁLISIS)
+# FUNCIÓN PARA CALCULAR RENDIMIENTOS HISTÓRICOS INDIVIDUALES (PUNTO 2.2)
 # ==========================================
 @st.cache_data(ttl=86400)  # Caché de 24 horas
 def calcular_rendimientos_historicos(tickers):
     rendimientos = {}
     for ticker in tickers:
         try:
-            # Descargamos 5 años de historial para estimar el retorno anualizado (CAGR)
-            hist = yf.download(ticker, period="5y", progress=False)['Close']
-            if not hist.empty:
-                precio_inicial = float(hist.dropna().iloc[0])
-                precio_final = float(hist.dropna().iloc[-1])
-                anios = len(hist) / 252  # ~252 días laborables al año
-                
-                cagr = (precio_final / precio_inicial) ** (1 / anios) - 1
-                # Límites realistas para la proyección (4% a 25%)
-                rendimientos[ticker] = max(min(cagr, 0.25), 0.04)  
+            # Descargamos 5 años de historial día a día
+            hist = yf.download(ticker, period="5y", progress=False)
+            if not hist.empty and 'Close' in hist.columns:
+                serie_close = hist['Close'].dropna()
+                if len(serie_close) > 10:
+                    precio_inicial = float(serie_close.iloc[0])
+                    precio_final = float(serie_close.iloc[-1])
+                    
+                    # Calcular años reales transcurridos en el dataset
+                    fecha_ini = serie_close.index[0]
+                    fecha_fin = serie_close.index[-1]
+                    anios_reales = (fecha_fin - fecha_ini).days / 365.25
+                    
+                    if anios_reales > 0:
+                        cagr = (precio_final / precio_inicial) ** (1 / anios_reales) - 1
+                        # Límites más amplios para el modelo de análisis (entre -10% y 45%)
+                        rendimientos[ticker] = float(max(min(cagr, 0.45), -0.10))
+                    else:
+                        rendimientos[ticker] = 0.08
+                else:
+                    rendimientos[ticker] = 0.08
             else:
                 rendimientos[ticker] = 0.08
         except Exception:
@@ -123,32 +134,19 @@ try:
     # PESTAÑA 1: PORTAFOLIO ACTUAL
     # =========================================================================
     with tab_actual:
-        
-        # 1. BANDERAS / FLAGS DE MÉTRICAS (Ubicadas horizontalmente arriba de los gráficos)
         st.subheader("📌 Resumen del Portafolio")
         m_col1, m_col2, m_col3 = st.columns(3)
         
         with m_col1:
-            st.metric(
-                label="Total de Inversión (Costo Inicial)", 
-                value=f"${total_inversion_inicial:,.2f}"
-            )
+            st.metric(label="Total de Inversión (Costo Inicial)", value=f"${total_inversion_inicial:,.2f}")
         with m_col2:
-            st.metric(
-                label="Precio Portafolio Actual (Valor de Mercado)", 
-                value=f"${total_portafolio_actual:,.2f}",
-                delta=f"${rendimiento_absoluto:+,.2f}"
-            )
+            st.metric(label="Precio Portafolio Actual", value=f"${total_portafolio_actual:,.2f}", delta=f"${rendimiento_absoluto:+,.2f}")
         with m_col3:
-            st.metric(
-                label="Porcentaje Rendimiento Total", 
-                value=f"{rendimiento_total_pct:+.2f}%",
-                delta="Retorno sobre inversión"
-            )
+            st.metric(label="Porcentaje Rendimiento Total", value=f"{rendimiento_total_pct:+.2f}%", delta="Retorno sobre inversión")
             
         st.divider()
         
-        # 2. GRÁFICOS DE PASTEL
+        # Gráficos
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("📊 Distribución por Sector")
@@ -165,7 +163,7 @@ try:
 
         st.divider()
 
-        # TABLA 2: Consolidada
+        # Tablas
         st.subheader("📋 Resumen Consolidado de Inversiones (Tabla 2)")
         df_agrupado_final = df_agrupado[['Ticker', '#Acciones', 'USD Actual', '$/Acción compra', '$/Acción actual', '$ ganancia (o perdida)', '% de ganancia (o perdida)']].rename(columns={'USD Actual': 'USD'})
         
@@ -188,7 +186,6 @@ try:
 
         st.divider()
 
-        # TABLA 3: Detalle histórico
         st.subheader("📜 Detalle de Transacciones Históricas (Tabla 3)")
         df_t3_mostrar = df_detalles[['Fecha', 'Tipo', 'Ticker', '#Acciones', 'USD Actual', '$/Acción compra', '$/Acción actual', '$ ganancia (o perdida)', '% de ganancia (o perdida)']].rename(columns={'USD Actual': 'USD'})
         st.dataframe(df_t3_mostrar.style.format({
@@ -196,64 +193,85 @@ try:
         }), use_container_width=True, hide_index=True)
 
     # =========================================================================
-    # PESTAÑA 2: MODELO DE PROYECCIÓN (A 5 AÑOS MES A MES)
+    # PESTAÑA 2: MODELO DE PROYECCIÓN 
     # =========================================================================
     with tab_proyeccion:
-        st.subheader("🔮 Simulación de Crecimiento de Capital (5 Años)")
-        st.markdown("Esta proyección utiliza las tasas de crecimiento reales calculadas por nuestro modelo de análisis histórico de los últimos 5 años.")
+        st.subheader("🔮 Configuración de Simulación a 5 Años")
+        
+        # 1. PARÁMETROS SUPERIORES: APORTACIÓN (DCA) Y GRANULARIDAD (Puntos 1 y 3)
+        col_ctrl1, col_ctrl2 = st.columns(2)
+        with col_ctrl1:
+            st.write("**💵 Aportaciones Adicionales (Opcional):**")
+            dca_mensual = st.number_input("Inyección de capital mensual (DCA en USD)", min_value=0, value=0, step=50)
+            st.caption("Se simula que compras este valor mensualmente de forma proporcional en tus activos actuales.")
+            
+        with col_ctrl2:
+            st.write("**📅 Rango y Visualización del Tiempo:**")
+            granularidad = st.radio(
+                "Frecuencia de la proyección:",
+                options=["Mes a Mes", "Año a Año"],
+                horizontal=True
+            )
+            st.caption("Determina si el cálculo de la proyección y las tablas muestran la trayectoria detallada mensual o agrupada anual.")
 
-        # Obtener rendimientos históricos calculados (Modelo de análisis)
+        st.divider()
+
+        # 2. CONFIGURACIÓN DE TASAS DE CRECIMIENTO HISTÓRICAS VS PROYECTADAS (Puntos 2 y 2.1)
+        st.subheader("📈 Configuración de Tasas de Crecimiento Anual (Por Ticker)")
+        st.markdown("La columna **'Tasa Proyectada (Futura)'** está habilitada para edición. Haz doble clic sobre cualquier celda para modificar la tasa y ver la simulación en tiempo real.")
+        
         tickers_unicos_proyeccion = sorted(list(set(df_agrupado['Ticker'].tolist())))
         cagrs = calcular_rendimientos_historicos(tickers_unicos_proyeccion)
         
-        col_p1, col_p2 = st.columns(2)
+        # Construir el DataFrame dinámico para st.data_editor
+        tasas_dict_list = []
+        for ticker in tickers_unicos_proyeccion:
+            tasa_hist = cagrs.get(ticker, 0.08)
+            tasas_dict_list.append({
+                "Ticker": ticker,
+                "Tasa Histórica (Últimos 5 Años)": float(tasa_hist),
+                "Tasa Proyectada (Futura)": float(tasa_hist) # Inicializado con la histórica
+            })
+        df_editor_input = pd.DataFrame(tasas_dict_list)
         
-        # Panel izquierdo: Tabla de Tasas de Crecimiento del Modelo de Análisis
-        with col_p1:
-            st.write("**📈 Tasas de Crecimiento Anual Estimadas por Ticker (Modelo de Análisis):**")
-            
-            # Construir un DataFrame limpio para la visualización de la tabla de tasas
-            tasas_data = []
-            for ticker in tickers_unicos_proyeccion:
-                tasas_data.append({
-                    "Ticker": ticker,
-                    "Tasa de Crecimiento (CAGR)": cagrs.get(ticker, 0.08)
-                })
-            df_tasas_modelo = pd.DataFrame(tasas_data)
-            
-            # Mostrar la tabla de tasas formateada
-            st.dataframe(
-                df_tasas_modelo.style.format({"Tasa de Crecimiento (CAGR)": "{:.2%}"}),
-                use_container_width=True,
-                hide_index=True
-            )
-            
-        # Panel derecho: Control de DCA mensual
-        with col_p2:
-            st.write("**💵 Aportaciones Adicionales (Opcional):**")
-            dca_mensual = st.number_input("Inyección de capital mensual (DCA en USD)", min_value=0, value=0, step=50)
-            st.caption("Si agregas un monto aquí, se simula que compras este valor mensualmente distribuyéndolo de forma proporcional en tus posiciones actuales.")
+        # st.data_editor permite modificar los valores dinámicamente en pantalla
+        df_editor_output = st.data_editor(
+            df_editor_input,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker", disabled=True),
+                "Tasa Histórica (Últimos 5 Años)": st.column_config.NumberColumn("Tasa Histórica (Últimos 5 Años)", format="%.2%", disabled=True),
+                "Tasa Proyectada (Futura)": st.column_config.NumberColumn("Tasa Proyectada (Futura)", format="%.2%", min_value=-0.50, max_value=1.00, step=0.01)
+            },
+            hide_index=True,
+            use_container_width=True,
+            key="editor_tasas"
+        )
+        
+        # Mapeamos las tasas proyectadas ingresadas por el usuario
+        tasas_proyectadas = dict(zip(df_editor_output['Ticker'], df_editor_output['Tasa Proyectada (Futura)']))
 
-        # ---- CONSTRUCCIÓN DE LA SIMULACIÓN MES A MES ----
+        st.divider()
+
+        # ---- CONSTRUCCIÓN DE LA SIMULACIÓN MEN DE PROYECCIÓN ----
         meses = 60  # 5 años
         fechas_proyeccion = [datetime.today().date() + pd.DateOffset(months=i) for i in range(meses + 1)]
         fechas_proyeccion = [f.date() for f in fechas_proyeccion]
 
         proyeccion_dict = {"Fecha": fechas_proyeccion}
         
-        # Obtener pesos actuales para el DCA
+        # Obtener pesos actuales para distribuir el DCA
         capital_inicial_total = df_agrupado['USD Actual'].sum()
         pesos_activos = {row['Ticker']: row['USD Actual'] / capital_inicial_total if capital_inicial_total > 0 else 0 for _, row in df_agrupado.iterrows()}
 
-        # Simular mes a mes por ticker usando la tasa fija asignada por el modelo
         for ticker in tickers_unicos_proyeccion:
             capital_inicial_activo = float(df_agrupado[df_agrupado['Ticker'] == ticker]['USD Actual'].iloc[0])
-            tasa_anual = cagrs.get(ticker, 0.08)
+            tasa_anual = tasas_proyectadas.get(ticker, 0.08)
             tasa_mensual = (1 + tasa_anual) ** (1/12) - 1
             peso_activo = pesos_activos.get(ticker, 0)
             
             saldos_mes = [capital_inicial_activo]
             for m in range(1, meses + 1):
+                # Aplicar rendimiento compuesto mensual + aportación DCA
                 nuevo_saldo = saldos_mes[-1] * (1 + tasa_mensual) + (dca_mensual * peso_activo)
                 saldos_mes.append(nuevo_saldo)
                 
@@ -262,46 +280,64 @@ try:
         df_proyeccion = pd.DataFrame(proyeccion_dict)
         df_proyeccion['Total Portafolio'] = df_proyeccion[tickers_unicos_proyeccion].sum(axis=1)
 
-        # ---- 1. GRÁFICO DE LÍNEAS TEMPORALES ----
+        # Si el usuario eligió ver la escala Año a Año, filtramos el dataframe
+        if granularidad == "Año a Año":
+            meses_corte = [0, 12, 24, 36, 48, 60]
+            df_proyeccion_display = df_proyeccion.iloc[meses_corte].copy()
+        else:
+            df_proyeccion_display = df_proyeccion.copy()
+
+        # ---- 3. SELECTOR DE TICKERS PARA EVITAR CONTAMINACIÓN VISUAL (Punto 3.1) ----
+        st.subheader("📉 Gráfico de Evolución del Capital")
+        
+        col_sel, _ = st.columns([3, 1])
+        with col_sel:
+            tickers_seleccionados = st.multiselect(
+                "Selecciona los Tickers que quieres analizar en la gráfica:",
+                options=tickers_unicos_proyeccion,
+                default=tickers_unicos_proyeccion
+            )
+            
+        # ---- 4. DIBUJAR GRÁFICA DE EVOLUCIÓN ----
         fig_lineas = go.Figure()
         
-        # Línea de capital total
+        # Línea de capital total (siempre visible)
         fig_lineas.add_trace(go.Scatter(
-            x=df_proyeccion['Fecha'],
-            y=df_proyeccion['Total Portafolio'],
-            mode='lines',
+            x=df_proyeccion_display['Fecha'],
+            y=df_proyeccion_display['Total Portafolio'],
+            mode='lines+markers' if granularidad == "Año a Año" else 'lines',
             name='Capital Total Proyectado',
             line=dict(color='#00ffcc', width=4)
         ))
         
-        # Líneas individuales por ticker
-        for ticker in tickers_unicos_proyeccion:
+        # Líneas individuales solo para los tickers seleccionados
+        for ticker in tickers_seleccionados:
             fig_lineas.add_trace(go.Scatter(
-                x=df_proyeccion['Fecha'],
-                y=df_proyeccion[ticker],
-                mode='lines',
+                x=df_proyeccion_display['Fecha'],
+                y=df_proyeccion_display[ticker],
+                mode='lines+markers' if granularidad == "Año a Año" else 'lines',
                 name=f"{ticker} Proyectado",
                 line=dict(width=1.5),
-                opacity=0.6
+                opacity=0.7
             ))
 
         fig_lineas.update_layout(
             template="plotly_dark",
-            title="Evolución Estimada del Capital a 5 Años",
-            xaxis_title="Fecha de Proyección",
+            xaxis_title="Fecha",
             yaxis_title="Capital Estimado (USD)",
-            hovermode="x unified"
+            hovermode="x unified",
+            margin=dict(t=20, b=20, l=10, r=10)
         )
         st.plotly_chart(fig_lineas, use_container_width=True)
 
         st.divider()
 
-        # ---- 2. TABLA DESGLOSADA POR TICKER ----
-        st.subheader("📋 Tabla de Saldos Proyectados Fin de Año (Mes 12 a 60)")
+        # ---- 5. TABLA DESGLOSADA POR TICKER ----
+        st.subheader("📋 Detalle de Saldos Proyectados")
         
-        # Seleccionamos las filas correspondientes a los cierres anuales (Meses 0, 12, 24, 36, 48, 60)
-        meses_corte = [0, 12, 24, 36, 48, 60]
-        df_cortes = df_proyeccion.iloc[meses_corte].copy()
+        # Generar la tabla estructurada para mostrar a fin de año
+        meses_corte_tabla = [0, 12, 24, 36, 48, 60]
+        df_cortes = df_proyeccion.iloc[meses_corte_tabla].copy()
         
         # Eliminamos la columna de fecha antes de transponer
         df_cortes_sin_fecha = df_cortes.drop(columns=['Fecha'])
